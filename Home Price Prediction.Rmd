@@ -1,0 +1,819 @@
+---
+title: "Boston Home Prices Prediction"
+author: "Yayin Cai"
+output: 
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: yes
+---
+
+
+```{r setup, include=FALSE}
+setwd("D:/Study/Portfolio/Boston Home Prices")
+```
+
+##Introduction
+Zillow, as one of the largest real estate online database, has seen a remarkable growth in recent years. However, its housing market predictions are found to be not as accurate as they could be. Home price prediction is a tricky task, because so many factors might influence the home prices, and it is hard to figure out the relationship between these factors and home prices.  
+To provide better home valuation service for Zillow's users, we built a predictive model of home prices for Boston using OLS regression, based on machine learning algorithms. For dependent variable, we used log-transformed sale price of 1286 properties in Boston. For independent variables, We introduced 36 predictors into the model, and took into consideration different aspects that were expected to be associated with home prices. Through out-sample prediction and cross-validation, we could ensure that the model is robust and relatively accurate.  
+Our final model could account for 81% variations in the log-transformed sale price. In training set, the root mean square error (RMSE) and mean absolute percent error (MAPE) are around 0.15 to 0.17 and 12%-13% respectively. The relatively low RMSE and MAPE indicate that it is a good model. In test set, we have computed Global Moran's I and have found that there is no significant spatial auto-correlation, which means that the model will not perform better or worse in some specific areas.  
+
+```{r library,include=FALSE,cache=TRUE}
+library(rgdal)
+library(tidyverse)
+library(dplyr)
+library(spatstat)
+library(sf)
+library(tibble)
+library(rgeos)
+library(tidyr)
+library(ggpubr)
+library(ggplot2)
+library(ggmap)
+library(stats)
+library(caret)
+library(MASS)
+library(spdep)
+library(gbm)
+library(randomForest)
+library(knitr)
+library(kableExtra)
+library(shiny)
+library(pander)
+library(memisc)
+library(leaflet)
+library(viridis)
+library(htmltools)
+library(htmlwidgets)
+library(networkD3)
+library(viridis)
+library(scales)
+library(curl)
+library(corrplot)
+
+mapTheme <- function() {
+  theme(
+    text = element_text(size = 12,face = "italic"),
+        plot.title = element_text(size = 17,face = "bold",colour = "black", hjust = 0),
+        plot.subtitle = element_text(size = 12, face = "italic", colour = "dark grey", hjust = 0),
+        plot.caption = element_text(size = 12, face = "italic", colour = "grey"),
+        panel.background = element_blank(),
+        legend.text = element_text(size = 15),
+        panel.border = element_rect(colour = "grey", fill=NA, size=1),
+        axis.ticks = element_blank(), 
+        panel.grid.major =  element_line(colour="white",size = rel(0.5)),
+        panel.grid.minor = element_blank(), 
+        plot.background = element_rect(fill = "white"),
+        plot.margin = unit(c(0,0,0,0), "lines"),
+        legend.position = "right")
+}
+
+baseMap <- get_map(location = c(lon = -71.077669, lat = 42.320769), 
+                   source = "stamen", 
+                   zoom = 11, 
+                   maptype= 'toner')
+
+my_palette=rev(viridis(10))[c(-1,-9)]
+```
+
+```{r import,include=FALSE,cache=TRUE}
+
+CHPM<-read.csv("newHomePrice.csv")
+
+qt_homeprice<-quantile(CHPM$SalePrice,seq(0,1,0.02))
+CHPM<-CHPM %>% filter(SalePrice>=qt_homeprice[2] & SalePrice <= qt_homeprice[50])
+```
+
+##1.Data
+The dataset we used basically consists of two parts: Boston_Midterm_Dataset, a dataset which includes the information of the properties, and data from online open data portals,like Open Data Boston, MassGIS, and Social Explorer (ACS 5-year estimated, 2015). We used the log-transformed sale price as the dependent variable. For independent variables, we have 37 predictors in total, which fall into five categories: internal predictors, demographic predictors, spatial predictors, spatial lag, and interactions.   
+**Internal Predictors**  
+Attributes of the property itself  
+**Demographic Predictors**  
+Demographic profile on block group level  
+**Spatial Predictors**  
+Distance to amenities and disamenities  
+**Spatial Lag**  
+Average sale price and price per square foot of nearby properties  
+**Interactions**  
+Interactions of some predictors  
+
+```{r variables,include=FALSE,cache=TRUE}
+Variable_list<-read.csv("variableList.csv")
+variable_list_table<-kable(Variable_list,format='html',caption='Variable List',
+                        align='c') %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+
+```
+
+```{r variable_table,echo=FALSE,cache=TRUE}
+variable_list_table
+```
+*Low income is defined as the percent of area median income (% AMI) no greater than 0.8.*
+ 
+### 1.1.Data: Exploratory analysis
+The summary statistics is presented as follows: 
+```{r summary,include=FALSE, cache=TRUE}
+Housing <- 
+  CHPM %>%
+  dplyr::select(SalePrice,LnSalePrice,LAND_SF,LivingArN,LnLivingArN,R_FPLACE,R_FULL_BTH, 
+                R_HALF_BTH ,R_TOTAL_RM,LnIncome,VacancyR,BachelorP,Dis_Hosp, Dis_PolSta, 
+                Dis_OS2, Dis_OS3 ,Dis_3bus,Dis_Sub,Dis_MR,Dis_River, Dis_DT, Dis_Univ,
+                Dis_SpZone,Dis_20crime , Dis_20inter,Dis_20bldgpmt,Dis_20rest,Dis_tourism)
+
+mean<-apply(Housing , 2, mean) %>% as.data.frame()
+colnames(mean)<-c("Mean")
+
+sd<-apply(Housing , 2, sd)%>% as.data.frame()
+colnames(sd)<-c("SD")
+
+median<-apply(Housing , 2, median)%>% as.data.frame()
+colnames(median)<-c("Median")
+
+min<-apply(Housing , 2, min)%>% as.data.frame()
+colnames(min)<-c("Min")
+
+max<-apply(Housing , 2, max)%>% as.data.frame()
+colnames(max)<-c("Max")
+
+HousingTable<-cbind(mean,median,sd,max,min)
+HousingTable<-lapply(HousingTable, round, 3) %>% as.data.frame()
+rownames(HousingTable)<-c("SalePrice","LnSalePrice","LAND_SF","LivingArN","LnLivingArN","R_FPLACE","R_FULL_BTH","R_HALF_BTH","R_TOTAL_RM","Dis_Hosp", "Dis_PolSta","Dis_OS2" , "Dis_OS3" ,"Dis_3bus","Dis_Sub" , "Dis_MR" , "Dis_River" , "Dis_DT" ,"Dis_Univ", "Dis_SpZone", "Dis_20crime" , "Dis_20inter" , "Dis_20bldgpmt","Dis_20rest" , "Dis_tourism" ,"LnIncome","VacancyR","BachelorP")
+
+Variables_table<-kable(HousingTable,format='html',caption='Summary Statistics',
+                        align='c',format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+
+```
+
+```{r SummaryTable,echo=FALSE,cache=TRUE}
+Variables_table
+
+```
+
+To observe the relationships between variables more intuitively, we created a correlation matrix, showing the correlation between variables. According to the matrix, the serious multicollineariy is observed among some spatial varialbes and the power of two of the variables, spatial lags, and interactions. Since these variables are regarded as very important, we included them into the model instead of dropping them. Except these variables, there is little multicollinearity among other predictors.
+
+```{r correlation,echo=FALSE,cache=TRUE,fig.height=12,fig.width=12,fig.align='center'}
+My_var<-CHPM %>% dplyr::select(LnSalePrice,LAND_SF, LnLivingArN , R_FULL_BTH , 
+           R_HALF_BTH , R_FPLACE , R_TOTAL_RM , Dis_Hosp , Dis_PolSta , 
+           Dis_OS2 , Dis_OS3 , Dis_OS3_p2 , Dis_3bus , Dis_Sub , Dis_Sub_p2 , 
+           Dis_MR , Dis_River , Dis_River_p2 , Dis_DT , Dis_DT_p2 , Dis_Univ,
+           Dis_SpZone , Dis_20crime , Dis_20inter , Dis_20bldgpmt , 
+           Dis_20rest , Dis_tourism ,LnIncome,BachelorP , VacancyR , SP_lag5 , 
+           SP_lag20 , AP_lag5 , AP_lag20 , Bac_Univ_Inter , LowInc_Area_Inter , 
+           LowInc_Room_Inter , LowInc_Crime_Inter)
+My_cor<-cor(My_var)
+
+col<-colorRampPalette(c("#006837","#31a354","#78c679","#c2e699","#ffffcc","#a1dab4","#41b6c4","#2c7fb8","#253494")
+)
+corrplot(My_cor, method="color",tl.col="black",col=col(200),tl.srt=45)
+
+```
+
+### 1.2.Data: Maps of Variables
+First, we could take a look at the home price distribution in Boston. We used log-transformed sale price in the model, and here is the original value.  
+
+```{r PriceMap,echo=FALSE,fig.width=12,fig.height=12,fig.align='center'}
+ggmap(baseMap) + 
+  geom_point(data = CHPM, 
+             aes(x=Longitude, y=Latitude, color=factor(ntile(SalePrice,5))), 
+             size = 1) + 
+  labs(title="Sale Price",
+       subtitle = "Boston Home Price Prediction") +
+  scale_colour_manual(values = my_palette,
+                      labels=as.integer(quantile(CHPM$SalePrice,
+                                                  na.rm=T)),
+                      name="Sale Price\n (Quintile Breaks)") +
+  mapTheme()
+```
+
+Then, here are some predictors we think are most interesting. First, we look at the living area in the structure. Here is the original value but we used log-transformed living area in the model.
+```{r LivingArea,echo=FALSE,fig.width=12,fig.height=12,fig.align='center'}
+ggmap(baseMap) + 
+  geom_point(data = CHPM, 
+             aes(x=Longitude, y=Latitude, color=factor(ntile(LivingArN,5))), 
+             size = 1) + 
+  labs(title="Living Area",
+       subtitle = "Boston Home Price Prediction") +
+  scale_colour_manual(values = my_palette,
+                      labels=as.integer(quantile(CHPM$LivingArN,
+                                                  na.rm=T)),
+                      name="Living Area\n (Quintile Breaks)") +
+  mapTheme()
+```
+
+The second one is income per capita of block group. To view it more intuitively, we used original value. But in the model, the predictor is log-transformed.
+```{r Income,echo=FALSE,fig.width=12,fig.height=12,fig.align='center'}
+ggmap(baseMap) + 
+  geom_point(data = CHPM, 
+             aes(x=Longitude, y=Latitude, color=factor(ntile(Per_Capita,5))), 
+             size = 1) + 
+  labs(title="Income per Capita",
+       subtitle = "Boston Home Price Prediction") +
+  scale_colour_manual(values = my_palette,
+                      labels=as.integer(quantile(CHPM$Per_Capita,
+                                                  na.rm=T)),
+                      name="Income\n per Capita\n (Quintile Breaks)") +
+  mapTheme()
+```
+
+The last one is the distance to the nearest subway station.
+```{r Dis_Sub,echo=FALSE,fig.width=12,fig.height=12,fig.align='center'}
+CHPM$Dis_Sub=round(CHPM$Dis_Sub,digits = 2)
+  
+ggmap(baseMap) + 
+  geom_point(data = CHPM, 
+             aes(x=Longitude, y=Latitude, color=factor(ntile(Dis_Sub,5))), 
+             size = 1) + 
+  labs(title="Distance to the Nearest Subway Station",
+       subtitle = "Boston Home Price Prediction") +
+  scale_colour_manual(values = my_palette,
+                      labels=as.double(quantile(CHPM$Dis_Sub,
+                                                  na.rm=T) %>% round(digits=2)),
+                      name="Distance to \n Subway Station\n (Quintile Breaks)") +
+  mapTheme()
+```
+
+
+### 1.3.Data: Variable Distribution
+
+To see the variable distributions across neighborhoods with different income level, we picked three neighborhoods:Charlestown(rich),South Boston(middle Income),Mattapan(poor).The boxplots show the variable distribution across neighborhoods.
+
+```{r var_distribution,echo=FALSE,cache=TRUE,warning=FALSE,fig.width=12,fig.height=12,fig.align='center'}
+Neighborhood3<- 
+  CHPM %>%
+  filter(Neighbor_1 == "Charlestown" | Neighbor_1 == "Mattapan" |Neighbor_1 == "South Boston"  ) %>%
+  mutate(NB_Income = as.factor(ifelse(Neighbor_1 == "Charlestown" ,'rich',
+                                      ifelse(Neighbor_1 == "Mattapan" ,'poor',
+                                             'middle')))) %>%
+dplyr::select(LAND_SF,LnLivingArN,R_FULL_BTH,R_HALF_BTH,R_FPLACE,R_TOTAL_RM,Dis_Hosp,       Dis_PolSta,Dis_OS2, Dis_OS3,Dis_3bus,Dis_Sub,Dis_MR, Dis_Univ , Dis_River ,Dis_DT ,Dis_Univ,Dis_SpZone, Dis_20crime , Dis_20inter, Dis_20bldgpmt , Dis_3spmkt, Dis_20rest , Dis_tourism ,LnIncome,BachelorP,VacancyR,NB_Income)%>%
+gather(variable, value,LAND_SF,LnLivingArN,R_FULL_BTH,R_HALF_BTH,R_FPLACE,R_TOTAL_RM,Dis_Hosp,Dis_PolSta,Dis_OS2, Dis_OS3,Dis_3bus,Dis_Sub,Dis_MR, Dis_Univ , Dis_River ,Dis_DT ,Dis_Univ,Dis_SpZone, Dis_20crime , Dis_20inter, Dis_20bldgpmt , Dis_3spmkt, Dis_20rest , Dis_tourism ,LnIncome,BachelorP,VacancyR)
+
+ggplot(data = Neighborhood3, aes(NB_Income,value)) +
+  geom_boxplot(aes(fill=NB_Income),width=25,alpha=0.6) +  
+  facet_wrap(~variable,scales="free",ncol=5) +
+  scale_fill_manual(values =c("#155898","#15727e","#4caf50"),name = "Neighborhoods",labels=c("Charlestown(rich)","South Boston(middle Income)","Mattapan(poor)")) +
+  labs(title="Variable Distribution across Neighborhoods",
+       subtitle = "Internal, Demographic and Spatial Predictors",
+       x="Neighborhood",
+       y="Value") +
+  theme(text = element_text(size = 12,face = "italic"),
+        plot.title = element_text(size = 17,face = "bold",colour = "black", hjust = 0),
+        plot.subtitle = element_text(size = 12, face = "italic", colour = "dark grey", hjust = 0),
+        plot.caption = element_text(size = 10, face = "italic", colour = "grey"),
+        legend.text = element_text(size = 10),
+        panel.border = element_rect(colour = "grey", fill=NA, size=1),
+        plot.background = element_rect(fill = "white"),
+        plot.margin = unit(c(0,0,0,0), "lines"))
+
+```
+
+
+## 2.Method
+Our methods could be discussed from three steps: data wrangling, building the model, and testing the model.  
+In the step of data wrangling, first, we determined our dependent variable. To meet the regression assumption, we used log-transformed sale price (dollar) as our final dependent variable. Second, we selected different types of predictors, which were expected to be associated with the dependent variable, and not highly correlated with each other. Third, we cleaned the data, removing outliers. The major tool for data wrangling is ArcGIS and R. Then, we used OLS linear regression for building the model. Finally, we tested the model by k-fold cross validation (k=100) to make sure that our model was generalizable. Also, we checked that there was little spatial autocorrelation in our model.
+
+## 3.Results
+Here is the regression formula:
+```{r formula}
+formula<- LnSalePrice ~ LAND_SF + LnLivingArN + R_FULL_BTH + 
+           R_HALF_BTH + R_FPLACE + R_TOTAL_RM + Dis_Hosp + Dis_PolSta + 
+           Dis_OS2 + Dis_OS3 + Dis_OS3_p2 + Dis_3bus + Dis_Sub + Dis_Sub_p2 + 
+           Dis_MR + Dis_River + Dis_River_p2 + Dis_DT + Dis_DT_p2 + Dis_Univ+
+           Dis_SpZone + Dis_20crime + Dis_20inter + Dis_20bldgpmt + 
+           Dis_20rest + Dis_tourism +LnIncome+BachelorP + VacancyR + SP_lag5 + 
+           SP_lag20 + AP_lag5 + AP_lag20 + Bac_Univ_Inter + LowInc_Area_Inter + 
+           LowInc_Room_Inter + LowInc_Crime_Inter
+```
+
+### 3.1.In-Sample Prediction
+Now, we could start building our model. We threw all predictors into the regression. The results are shown as follows. The number of star markers indicates how significant the variable is. The adjusted R square suggests that around 81% of the variations in dependent variable could be explained by the model.
+
+```{r InSample,include=FALSE,cache=TRUE}
+reg1<-lm(formula,
+           data = CHPM)
+summary(reg1)
+```
+
+```{r InSample_table,echo=FALSE}
+panderOptions('table.alignment.default', 'center')
+reg1_summary<-data.frame(R_Square=summary(reg1)$r.square,
+                         Adjusted_R_Square=summary(reg1)$adj.r.square,
+                         F_Statistics=summary(reg1)$fstatistic[1],
+                         Num_Predictors=summary(reg1)$fstatistic[2],
+                         Num_Observations=summary(reg1)$fstatistic[3])
+rownames(reg1_summary)<-c("In-Sample Prediction")
+
+reg1_table<-kable(reg1_summary,format='html',caption='In-Sample Prediction Results',
+                        align='c',format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+
+reg1_table
+
+pander(reg1,add.significance.stars = TRUE)
+
+```
+
+###3.2.Out-Sample Prediction
+
+One goal of the predictive model is generalizability. To know how well the model performs on unseen data, we seperated the data into two parts: 25% randomly selected test set and 75% remaining training set. The idea of this step is to build model by training set, and observe its performance on prediction of test set.  
+Here is the results of randomly selected training set (75%) and test set (25%). The Mean Absolute Percent Error (MAPE) of training set and test set is around 12% and 13% seperately.
+```{r randomdata,include=FALSE, cache=TRUE}
+set.seed(940)
+inTrain <- createDataPartition(
+  y = CHPM$Neighbor_reclass, 
+  p = 0.75, list = FALSE)
+training <- CHPM[ inTrain,] #the new training set
+test <- CHPM[-inTrain,]  #the new test set
+
+save(training,file="training.RData")
+save(test,file="test.RData")
+```
+
+
+```{r OutSample,include=FALSE,cache=TRUE}
+load("training.RData")
+load("test.RData")
+
+reg2<-lm(formula,
+         data = training)
+
+reg_tr_PredValues <- 
+  data.frame(observedHP = training$SalePrice,
+             predictedHP =exp(reg2$fitted.values))
+
+reg_tr_results <-
+  reg_tr_PredValues %>%
+  mutate(error = predictedHP - observedHP) %>%
+  mutate(absError = abs(predictedHP - observedHP)) %>%
+  mutate(percentAbsError = abs(predictedHP - observedHP) / observedHP)
+
+
+rmse <- function(error)
+{
+  sqrt(mean(error^2))
+}
+
+reg_tr_table<-data.frame(R_Square=summary(reg2)$r.square,
+                         RMSE=rmse(reg2$residuals),
+                         MAE=mean(reg_tr_results$absError),
+                         MAPE=mean(reg_tr_results$percentAbsError))
+
+#test set
+regPred <- predict(reg2, test)
+
+regPredValues <- 
+  data.frame(observedHP= test$SalePrice,
+             predictedHP =exp(regPred))
+
+test_residuals<-test$LnSalePrice-regPred
+  
+regPredValues <-
+  regPredValues %>%
+  mutate(error = predictedHP - observedHP) %>%
+  mutate(absError = abs(predictedHP - observedHP)) %>%
+  mutate(percentAbsError = abs(predictedHP - observedHP) / observedHP) 
+
+#Calculate R square for test set
+test.y    <-test$LnSalePrice
+
+SS.total <- sum((test.y - mean(test.y))^2)
+SS.residual   <- sum((test.y - regPred)^2)
+SS.regression <- sum((regPred - mean(test.y))^2)
+SS.total - (SS.regression+SS.residual)
+test.rsq <- 1 - SS.residual/SS.total  
+
+reg_test_table<-data.frame(R_Square=test.rsq,
+                           RMSE=rmse(test_residuals),
+                           MAE=mean(regPredValues$absError),
+                           MAPE=mean(regPredValues$percentAbsError))
+
+outSample<-rbind(reg_tr_table,reg_test_table)
+rownames(outSample)<-c("Training","Test")
+
+Outsample_table<-kable(outSample,format='html',caption='Out-Sample Prediction Results',
+                        align='c',format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+
+
+```
+
+```{r Oussample_table,echo=FALSE}
+Outsample_table
+```
+
+### 3.3.Cross-validation
+
+Even though we have tested our model on unseen data, it is still not enough. To ensure that our model is generalizable, we have to conduct cross-validation. We used an algorithm called "k-fold cross-validation". That is, the original sample is randomly partitioned by k equal size subsamples. Every time we pick one of them as test set and train the model with the remaining (k-1) subsamples for k times. In this way, we could see if the model is robust across samples. Here, k=100. [See Definition](https://www.openml.org/a/estimation-procedures/1)  
+Here is the histogram
+
+```{r CV,echo=FALSE,message=FALSE,cache=TRUE,fig.height=5,fig.width=7,fig.align='center'}
+fitControl <- trainControl(method = "cv", number = 100)
+set.seed(800)
+model_CV <- train(formula,
+                    data=CHPM,
+                    method="lm",
+                    trControl = fitControl)
+
+CV_table<-data.frame(RMSE=mean(model_CV$resample$RMSE),
+                     R_square=mean(model_CV$resample$Rsquared),
+                     MAE=mean(model_CV$resample$MAE),
+                     SD_MAE=sd(model_CV$resample[,3]))
+
+ggplot(as.data.frame(model_CV$resample), aes(MAE)) + 
+  geom_histogram(fill = "#4caf50",alpha = 0.7,bins=10) +
+  labs(title = "Distribution of Mean Absolute Error (MAE)",
+       subtitle = "Original MAE(log-transformed)",
+       x="Mean Absolute Error ",
+       y="Count",
+       caption = "Boston Home Price Prediction") + 
+   theme(
+    text = element_text(size = 12,face = "italic"),
+    plot.title = element_text(size = 12,face = "bold",colour = "black", hjust = 0),
+    plot.subtitle = element_text(size = 10, face = "italic", colour = "dark grey", hjust = 0),
+    plot.caption = element_text(size = 10, face = "italic", colour = "grey"),
+    legend.position="none",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(size = 8, face = "italic", colour = "grey")
+  )
+
+```
+
+### 3.4.Residuals
+
+Residual is the deviation of the observed value from the predicted value. We created two graphs to show the residuals as a function of the observed value and the predicted value for 25% randomly selected test set.
+
+```{r residuals,echo=FALSE,fit.height=12,fig.width=9,fig.align='center'}
+p1<-ggplot(test, aes(x=test.y, y=test.y - regPred)) +
+  geom_point(shape=16,size=1,color="#4caf50") +
+  geom_hline(yintercept=0, colour = "#15727e", size=1,alpha=0.5)+
+  labs(title = "Residual as a Function of Observed Value",
+       subtitle = "Original residual",
+       x="Observed Value",
+       y="Original Residual",
+       caption = "Boston Home Price Prediction") + 
+   theme(
+    text = element_text(size = 12,face = "italic"),
+    plot.title = element_text(size = 12,face = "bold",colour = "black", hjust = 0),
+    plot.subtitle = element_text(size = 10, face = "italic", colour = "dark grey", hjust = 0),
+    plot.caption = element_text(size = 10, face = "italic", colour = "grey"),
+    legend.position="none",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(size = 8, face = "italic", colour = "grey")
+  )
+
+
+p2<-ggplot(test, aes(x=regPred, y=test.y - regPred)) +
+  geom_point(shape=16,size=1,color='#155898') +
+  geom_hline(yintercept=0, colour = "#15727e", size=1,alpha=0.5)+
+  labs(title = "Residual as a Function of Predicted Value",
+       subtitle = "Original residual",
+       x="Predicted Value",
+       y="Original Residual",
+       caption = "Boston Home Price Prediction") + 
+   theme(
+    text = element_text(size = 12,face = "italic"),
+    plot.title = element_text(size = 12,face = "bold",colour = "black", hjust = 0),
+    plot.subtitle = element_text(size = 10, face = "italic", colour = "dark grey", hjust = 0),
+    plot.caption = element_text(size = 10, face = "italic", colour = "grey"),
+    legend.position="none",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(size = 8, face = "italic", colour = "grey")
+  )
+
+p3<-ggplot(test, aes(x=exp(test.y), y=exp(test.y) - exp(regPred))) +
+  geom_point(shape=16,size=1,color="#4caf50") +
+  geom_hline(yintercept=0, colour = "#15727e", size=1,alpha=0.5)+
+  labs(title = "Residual as a Function of Observed Price",
+       subtitle = "Converted residual",
+       x="Observed Price",
+       y="Converted Residual",
+       caption = "Boston Home Price Prediction") + 
+  scale_y_continuous(labels = comma)+
+   theme(
+    text = element_text(size = 12,face = "italic"),
+    plot.title = element_text(size = 12,face = "bold",colour = "black", hjust = 0),
+    plot.subtitle = element_text(size = 10, face = "italic", colour = "dark grey", hjust = 0),
+    plot.caption = element_text(size = 10, face = "italic", colour = "grey"),
+    legend.position="none",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(size = 8, face = "italic", colour = "grey")
+  )
+
+
+p4<-ggplot(test, aes(x=exp(regPred), y=exp(test.y) - exp(regPred)))+
+  geom_point(shape=16,size=1,color='#155898') +
+  geom_hline(yintercept=0, colour = "#15727e", size=1,alpha=0.5)+
+  labs(title = "Residual as a Function of Predicted Price",
+       subtitle = "Converted residual",
+       x="Predicted Price",
+       y="Converted Residuals",
+       caption = "Boston Home Price Prediction")  + 
+  scale_y_continuous(labels = comma)+ 
+   theme(
+    text = element_text(size = 12,face = "italic"),
+    plot.title = element_text(size = 12,face = "bold",colour = "black", hjust = 0),
+    plot.subtitle = element_text(size = 10, face = "italic", colour = "dark grey", hjust = 0),
+    plot.caption = element_text(size = 10, face = "italic", colour = "grey"),
+    legend.position="none",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_text(size = 8, face = "italic", colour = "grey")
+  )
+
+ggarrange(p1,p2,p3,p4,ncol=2,nrow=2)
+```
+
+
+### 3.5.Spatial Auto-correlation
+
+Spatial auto-correlation refers to a measure of the degree to which a set of spatial features and their associated data values tend to be clustered together in space (positive spatial auto-correlation) or dispersed (negative spatial auto-correlation). [See Definition](http://support.esri.com/en/other-resources/gis-dictionary/term/spatial%20auto-correlation).  
+We computed Global Moran's I of the residuals of the test set to measure the spatial auto-correlation, and, to find if our predictive model performs better or worse in some specific areas.  
+
+```{r SPAC,include=FALSE,cache=TRUE}
+test_res_ori <- test$LnSalePrice - regPred
+test_res_conv<-test$SalePrice-exp(regPred)
+test_residuals<-data.frame(test_res_ori,test_res_conv)
+LonLat <- data.frame(test$Longitude, test$Latitude)
+residualsToMap <- cbind(LonLat ,test_residuals)
+colnames(residualsToMap) <- c("longitude", "latitude","residual","gap")
+
+coords <- cbind(test$Longitude, test$Latitude)
+spatialWeights <- knn2nb(knearneigh(coords, 4))
+Moran_ori<-moran.test(test_res_ori, nb2listw(spatialWeights, style="W"))
+Moran_conv<-moran.test(test_res_conv, nb2listw(spatialWeights, style="W"))
+
+pvalue_ori<-Moran_ori$p.value %>% as.data.frame
+rownames(pvalue_ori)<-c("p-value")
+estimate_ori<-Moran_ori$estimate %>% as.data.frame
+ori_moran<-rbind(pvalue_ori,estimate_ori)
+colnames(ori_moran)<-c("Original")
+
+pvalue_conv<-Moran_conv$p.value %>% as.data.frame
+rownames(pvalue_conv)<-c("p-value")
+estimate_conv<-Moran_conv$estimate %>% as.data.frame
+conv_moran<-rbind(pvalue_conv,estimate_conv)
+colnames(conv_moran)<-c("Converted")
+
+residual_SA<-cbind(ori_moran,conv_moran)
+
+residual_SA.T <- t(residual_SA[,1:ncol(residual_SA)])
+
+SP_table<-kable(residual_SA.T,format='html',caption='Spatial Autocorrelation Test',
+                        align='c',format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+```
+
+Moran's I ranges from 1(cluster) to -1(disperse). In Moran's I test, p-value is more than 0.05, which means that spatial auto-correlation of residual is not significant.
+
+```{r SP_table,echo=FALSE}
+SP_table
+```
+
+Here is the residual map:
+
+```{r residual_map,echo=FALSE,fig.height=12,fig.width=12,fig.align='center'}
+
+ggmap(baseMap) + 
+  geom_point(data = residualsToMap, 
+             aes(x=longitude, y=latitude, color=factor(ntile(gap,5))), 
+             size = 2) + 
+  labs(title = "Residual Map",
+       subtitle = "Boston Home Price Prediction",
+       caption = "Regression residuals converted back to original value") + 
+  scale_colour_manual(values = my_palette ,
+                      labels=as.character(quantile(residualsToMap$gap,
+                                                   c(.1,.2,.4,.6,.8),na.rm=T)%>% round(digits=0)),
+                      name="Residuals\n (Quintile Breaks)") +
+  mapTheme()
+```
+
+### 3.6.Results: Predicted Values on Map
+
+Now, we could map the predicted price (predicted value converted back to price).
+```{r PredValue,echo=FALSE,cache=TRUE,fig.height=12,fig.width=12,fig.align='center'}
+PreValueToMap <- cbind(LonLat ,exp(regPred))
+colnames(PreValueToMap) <- c("longitude", "latitude","PredictedValue")
+
+ggmap(baseMap) + 
+  geom_point(data = PreValueToMap, 
+             aes(x=longitude, y=latitude, color=factor(ntile(PredictedValue,5))), 
+             size = 2) + 
+  labs(title = "Predicted Value on Map",
+       subtitle = "Boston Home Price Prediction",
+       caption = "Predicted value converted back to home price") + 
+  scale_colour_manual(values = my_palette,
+                      labels=as.character(quantile(PreValueToMap$PredictedValue,
+                                                   c(.1,.2,.4,.6,.8),na.rm=T)%>% round(digits=0)),
+                      name="Predicted Value\n (Quintile Breaks)") +
+  mapTheme()
+```
+
+### 3.7.Results: Prediction across Neighborhoods
+
+We calculated MAPE and average home price by neighborhood for training set. Except Mission Hill, MAPE in other neighborhoods are smaller than 20%. MAPE in Mission Hill is around 22%, which is still good. The results show that there is little variation across neighborhoods, which endorsed the generalizability of the model.
+
+```{r MAPE_NB,include=FALSE}
+Bos_NB<-st_read("Bos_neighborhoods.shp")
+training_data<-cbind(reg_tr_results,training)
+MAPE_NB<-group_by(training_data,Neighbor_1) %>% dplyr::summarise(Count=n(),MAPE=mean(percentAbsError,na.rm=TRUE),Mean_SalePrice=as.integer(mean(SalePrice)))
+NB_join_MAPE = merge(MAPE_NB,Bos_NB, by.x ="Neighbor_1", by.y = "Name")
+NB_join_MAPE$MAPE<-round(NB_join_MAPE$MAPE,digits=5)
+NB_join_MAPE$Neighborhood<-NB_join_MAPE$Neighbor_1
+NB_join_MAPE<-NB_join_MAPE %>% filter(Count>3)
+
+NB_table<-NB_join_MAPE %>% dplyr::select(Neighborhood,MAPE,Mean_SalePrice,Count)
+format(NB_table$Mean_SalePrice,big.mark=",",scientific=TRUE)
+
+Neighborhood_table<-kable(NB_table,format='html',caption='MAPE and Average Sale Price by Neighborhood',
+                        align='c',format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+
+
+```
+
+```{r MAPE_table,echo=FALSE,fit.height=8,fig.width=8,fig.align='center'}
+Neighborhood_table
+```
+*We removed neighborhoods where the number of properties is no more than 3.*  
+
+Here is the map of MAPE:
+
+```{r MAPE_map,echo=FALSE,fit.height=8,fig.width=8,fig.align='center'}
+ggplot() +
+  geom_sf(data=NB_join_MAPE, aes(fill=(MAPE)),color = "white", size = 0.5,linetype = 1)+
+    labs(title = "MAPE by Neighborhood",
+    subtitle = "Average Mean Absolute Percent Error(MAPE)") + 
+  scale_fill_gradient2(low = "#4caf50", mid="#15727e",high = "#155898",midpoint=0.16,
+                      name="MAPE\n ") +
+  mapTheme()
+```
+
+### 3.8.Results: Spatial Cross-validation
+
+To see if our model could work well in both rich and poor neighborhoods, we conducted spatial cross-validation. The basic idea of this test is that we removed a relatively rich, poor, and middle-income neighborhood as the test set every time, and built model by the remaining observations (training set). Then, we could see how the model would perform on the removed test set.  
+
+```{r Selected_NB,include=FALSE}
+Rich_Select <-
+  Bos_NB %>%
+  filter(Name=='Charlestown')
+Poor_Select <-
+  Bos_NB %>%
+  filter(Name=='Mattapan')
+Middle_Select <-
+  Bos_NB %>%
+  filter(Name=='South Boston')
+
+bostonNB <-
+  Bos_NB %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "Boston Neighborhoods")
+
+bostonRich <-
+  Rich_Select %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "Charlestown(rich)")  
+
+bostonPoor <-
+  Poor_Select %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "Mattapan(poor)")  
+
+bostonMiddle <-
+  Middle_Select %>%
+  dplyr::select(geometry) %>%
+  mutate(Legend = "South Boston(middle income)")  
+```
+
+```{r Selected_NB_map,echo=FALSE,fig.height=6,fit.height=8,fig.width=8,fig.align='center'}
+bostonSelectedNB <- 
+  rbind(bostonNB,bostonRich,bostonPoor,bostonMiddle)
+
+ggplot() + 
+  geom_sf(data=bostonSelectedNB, aes(fill=Legend), color = "white", size = 0.5,linetype = 1) +
+  
+  scale_fill_manual(values = c("grey","#155898","#15727e","#4caf50"),
+                    name = "Neighborhoods",
+                    labels=c("Boston Neighborhoods","Charlestown(rich)","South Boston(middle income)","Mattapan(poor)")) +
+  
+  labs(title = "Selected Neighborhoods",
+       subtitle = "By different income level") +
+  mapTheme() 
+
+```
+
+```{r SpatialCV,include=FALSE}
+RichNB<-CHPM %>% filter(Neighbor_1=='Charlestown')
+
+Rem_Rich<-CHPM %>% filter(Neighbor_1!='Charlestown') 
+
+reg_rich<-lm(formula,data=Rem_Rich)
+
+summary(reg_rich)
+
+regPred_rich <- predict(reg_rich,RichNB) 
+
+reg_rich_PredValues <- 
+  data.frame(observedHP = RichNB$SalePrice,
+             predictedHP =exp(regPred_rich))
+
+reg_rich_results <-
+  reg_rich_PredValues %>%
+  mutate(error = predictedHP - observedHP) %>%
+  mutate(absError = abs(predictedHP - observedHP)) %>%
+  mutate(percentAbsError = abs(predictedHP - observedHP) / observedHP)
+
+head(reg_rich_results)
+mean(reg_rich_results$absError)
+mean(reg_rich_results$percentAbsError)
+
+#Romove poor
+PoorNB<-CHPM %>% filter(Neighbor_1=='Mattapan') 
+
+Rem_Poor<-CHPM %>% filter(Neighbor_1!='Mattapan') 
+
+reg_poor<-lm(formula,data=Rem_Poor)
+
+summary(reg_poor)
+
+regPred_poor <- predict(reg_poor,PoorNB) 
+
+reg_poor_PredValues <- 
+  data.frame(observedHP = PoorNB$SalePrice,
+             predictedHP =exp(regPred_poor))
+
+reg_poor_results <-
+  reg_poor_PredValues %>%
+  mutate(error = predictedHP - observedHP) %>%
+  mutate(absError = abs(predictedHP - observedHP)) %>%
+  mutate(percentAbsError = abs(predictedHP - observedHP) / observedHP)
+
+head(reg_poor_results)
+mean(reg_poor_results$absError)
+mean(reg_poor_results$percentAbsError)
+
+#Remove middle
+MiddleNB<-CHPM %>% filter(Neighbor_1=='South Boston') 
+
+Rem_Middle<-CHPM %>% filter(Neighbor_1!='South Boston') 
+
+reg_middle<-lm(formula,data=Rem_Middle)
+summary(reg_middle)
+
+regPred_middle <- predict(reg_middle,MiddleNB) 
+
+reg_middle_PredValues <- 
+  data.frame(observedHP = MiddleNB$SalePrice,
+             predictedHP =exp(regPred_middle))
+
+reg_middle_results <-
+  reg_middle_PredValues %>%
+  mutate(error = predictedHP - observedHP) %>%
+  mutate(absError = abs(predictedHP - observedHP)) %>%
+  mutate(percentAbsError = abs(predictedHP - observedHP) / observedHP)
+
+head(reg_middle_results)
+mean(reg_middle_results$absError)
+mean(reg_middle_results$percentAbsError)
+
+Spatial_CV_results<-data.frame(
+  MAE_Rich=as.integer(mean(reg_rich_results$absError)),
+  MAPE_Rich=round(mean(reg_rich_results$percentAbsError),3),
+  MAE_Poor=as.integer(mean(reg_poor_results$absError)),
+  MAPE_Poor=round(mean(reg_poor_results$percentAbsError),3),
+  MAE_Middle=as.integer(mean(reg_middle_results$absError)),
+  MAPE_Middle=round(mean(reg_middle_results$percentAbsError),3)
+)
+
+Spatial_CV_table<-kable(Spatial_CV_results,format='html',caption='Spatial Cross-validation Results',
+                        align='c',format.args = list(big.mark = ",")) %>%
+kable_styling(latex_options = c("striped", "hold_position"),full_width = F)
+
+```
+
+According to the results, the model performs better when holding out the poor neighborhood, training the rest dataset and testing on the poor neighborhood.
+```{r SpatialCV_table,echo=FALSE}
+Spatial_CV_table
+```
+
+## 4.Discussion
+Generally speaking, it is an effective model. For one thing, it could account for 81% of variations in the log-transformed sale price. For another, the model is generalizable, which means that it performs similarly well across neighborhoods. According to the regression results, we have found some interesting predictors. First, all variables concerning internal attributes are significant.  
+Second, many spatial predictors related to distance are effective predictors of home prices. This is within our expectation. Large-size open spaces are usually neighborhood parks and golf course, which will add value to nearby properties. The proximity to subway is also an important factor people take into consideration when they are buying a house. Another significant predictor is the proximity to business or mixed-use zoned areas, because they are usually dynamic and full of potential. So, it could add value to the nearby properties.  
+Third, the demographic profile is vital in predicting home prices as well. The income per capita is a good predictor of home prices.  
+Last, the variables of nearby property values, namely spatial lag, make difference to the model. When people buy a house, they usually buy a neighborhood indeed.  
+To test the effectiveness and generalizability of the model, we did out-sample prediction, using 25% randomly selected test set. Also, we performed cross-validation on the model, and the results are good. The MAPE of both training set and test set is relatively small. The standard deviation of the MAE in cross-validation is small, which indicates that the model is generalizable. According to the spatial auto-correlation test and MAPE map by neighborhood, our model generally performs similarly well on different areas (neighborhoods).  
+But there is still some little difference in the performance of model across neighborhoods. Through spatial cross-validation, we have found that the model predicts particularly well when holding out poor neighborhood (built the model using the remaining neighborhoods, and predicted for the poor). The possible reason could be that the data size is not big enough, because all three neighborhoods we selected out only had around 50 observations. Another possible reason might be that there were some factors the rich cared about very much but we overlooked.  
+
+## 5.Conclusion
+We highly recommend that Zillow should use our model, which will generate considerable benefits to Zillow, because our model is effective and generalizable. But the model could still be improved in three aspects. First, if the model is applied to other cities, models might need to be changes according to the city condition. Second, we should use larger dataset and include more observations if possible. Third, we might consider more factors that the rich care about when they purchase a property to improve its performance on different neighborhoods.
+
+
+
